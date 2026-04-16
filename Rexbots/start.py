@@ -25,10 +25,11 @@ async def get_thumb(user_id: int, acc, msg_type: str, msg, file_path: str) -> st
     """
     Thumbnail resolution order:
     1. Custom thumbnail set by the user (stored in DB as Telegram file_id).
-    2. For Video/Animation: auto-extract a frame at 10 s using FFmpeg.
-    3. Original file's own thumbnail (thumbs[0]), if present.
-    4. None  →  no thumbnail.
-    
+    2. For Video/Document: auto-extract a frame at 10 s using FFmpeg.
+       If the video is shorter than 10 s, falls back to frame at 1 s.
+    3. None  →  no thumbnail.
+       The file's own embedded thumbnail is intentionally never used.
+
     The returned path is always a local .jpg file that the caller must
     delete after uploading.
     """
@@ -48,44 +49,30 @@ async def get_thumb(user_id: int, acc, msg_type: str, msg, file_path: str) -> st
         except Exception:
             thumb_path = None
 
-    # ── 2. FFmpeg auto-extract for Video (and document videos) ───────────────
+    # ── 2. FFmpeg auto-extract for Video / Document ──────────────────────────
+    #    The file's own embedded thumbnail is intentionally skipped.
+    #    FFmpeg always generates a fresh frame so the thumbnail is never
+    #    whatever was baked into the original file.
     if thumb_path is None and msg_type in ("Video", "Document"):
-        try:
-            os.makedirs("thumbs", exist_ok=True)
-            ffmpeg_out = f"thumbs/{user_id}_auto.jpg"
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y",
-                "-ss", "10",          # seek to 10 seconds
-                "-i", file_path,
-                "-vframes", "1",      # grab exactly one frame
-                "-vf", "scale=320:-1",
-                ffmpeg_out,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.communicate()
-            if os.path.exists(ffmpeg_out) and os.path.getsize(ffmpeg_out) > 0:
-                return ffmpeg_out
-        except Exception:
-            pass
-
-    # ── 3. Original file's own thumbnail ────────────────────────────────────
-    if thumb_path is None:
-        try:
-            thumbs_attr = None
-            if msg_type == "Document" and hasattr(msg, "document"):
-                thumbs_attr = msg.document.thumbs
-            elif msg_type == "Video" and hasattr(msg, "video"):
-                thumbs_attr = msg.video.thumbs
-            elif msg_type == "Audio" and hasattr(msg, "audio"):
-                thumbs_attr = msg.audio.thumbs
-
-            if thumbs_attr:
-                thumb_path = await acc.download_media(thumbs_attr[0].file_id)
-                if thumb_path and os.path.exists(thumb_path):
-                    return thumb_path
-        except Exception:
-            pass
+        os.makedirs("thumbs", exist_ok=True)
+        ffmpeg_out = f"thumbs/{user_id}_auto.jpg"
+        for seek in ("10", "00:00:01"):   # try 10 s first, fall back to 1 s
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y",
+                    "-ss", seek,
+                    "-i", file_path,
+                    "-vframes", "1",
+                    "-vf", "scale=320:-1",
+                    ffmpeg_out,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.communicate()
+                if os.path.exists(ffmpeg_out) and os.path.getsize(ffmpeg_out) > 0:
+                    return ffmpeg_out
+            except Exception:
+                pass
 
     return None
 
