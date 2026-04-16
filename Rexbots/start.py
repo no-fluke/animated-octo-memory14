@@ -36,18 +36,34 @@ async def get_thumb(user_id: int, acc, msg_type: str, msg, file_path: str) -> st
     thumb_path = None
 
     # ── 1. Custom thumbnail from DB ──────────────────────────────────────────
+    # FILE_REFERENCE_EXPIRED is common for large files: the file_id stored in
+    # the DB expires by the time the big download finishes. We retry once after
+    # a short pause (Telegram reissues the reference). If both attempts fail we
+    # fall through silently to FFmpeg — never raising an exception to the caller.
+    from pyrogram.errors import FileReferenceExpired as _FRE
     custom_file_id = await db.get_thumbnail(user_id)
     if custom_file_id:
-        try:
-            os.makedirs("thumbs", exist_ok=True)
-            thumb_path = await acc.download_media(
-                custom_file_id,
-                file_name=f"thumbs/{user_id}_custom.jpg"
-            )
-            if thumb_path and os.path.exists(thumb_path):
-                return thumb_path
-        except Exception:
-            thumb_path = None
+        for _attempt in range(2):
+            try:
+                os.makedirs("thumbs", exist_ok=True)
+                dl_path = await acc.download_media(
+                    custom_file_id,
+                    file_name=f"thumbs/{user_id}_custom.jpg"
+                )
+                if dl_path and os.path.exists(dl_path) and os.path.getsize(dl_path) > 0:
+                    return dl_path
+                # 0-byte result — clean up and fall through
+                if dl_path and os.path.exists(dl_path):
+                    os.remove(dl_path)
+                break
+            except _FRE:
+                if _attempt == 0:
+                    await asyncio.sleep(3)   # brief pause; Telegram reissues the reference
+                    continue
+                # second attempt also failed — fall through to FFmpeg
+                break
+            except Exception:
+                break    # any other error — fall through to FFmpeg
 
     # ── 2. FFmpeg auto-extract for Video / Document ──────────────────────────
     #    The file's own embedded thumbnail is intentionally skipped.
